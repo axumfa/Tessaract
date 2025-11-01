@@ -4,6 +4,7 @@ scikit-learn
 xgboost
 fastapi
 uvicorn
+python-multipart
 joblib
 kafka-python
 boto3
