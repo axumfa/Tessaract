@@ -8,7 +8,9 @@ import xgboost as xgb
 logging.basicConfig(level=logging.INFO)
 
 # Load trained model
-xgb_model = joblib.load('/Users/veedhibhanushali/fraud-detection-system/src/xgb_model.pkl')
+import os
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+xgb_model = joblib.load(os.path.join(BASE_DIR, 'src', 'xgb_model.pkl'))
 
 consumer = KafkaConsumer(
     'fraud_transactions',
