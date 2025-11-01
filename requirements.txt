@@ -14,3 +14,4 @@ optuna
 lightgbm==4.6.0
 imbalanced-learn==0.10.1
 pydantic>=1.10.12
+python-multipart
