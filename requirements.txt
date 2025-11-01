@@ -13,4 +13,4 @@ psycopg2-binary
 optuna
 lightgbm==4.6.0
 imbalanced-learn==0.10.1
-pydantic==1.10.7
+pydantic>=1.10.12

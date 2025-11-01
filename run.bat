@@ -2,10 +2,44 @@
 REM Simple batch script to run FastAPI service on Windows
 
 echo 🚀 Starting Fraud Detection System...
+echo.
+
+REM Check if virtual environment exists
+if not exist "venv\Scripts\activate.bat" (
+    echo ❌ Virtual environment not found!
+    echo 🔹 Creating virtual environment...
+    python -m venv venv
+    if errorlevel 1 (
+        echo ❌ Failed to create virtual environment. Please install Python first.
+        pause
+        exit /b 1
+    )
+    echo ✅ Virtual environment created.
+)
 
 REM Activate virtual environment
 echo 🔹 Activating virtual environment...
 call venv\Scripts\activate.bat
+if errorlevel 1 (
+    echo ❌ Failed to activate virtual environment.
+    pause
+    exit /b 1
+)
+
+REM Check if uvicorn is installed
+python -c "import uvicorn" 2>nul
+if errorlevel 1 (
+    echo ❌ Dependencies not installed!
+    echo 🔹 Installing dependencies...
+    pip install -r requirements.txt
+    if errorlevel 1 (
+        echo ❌ Failed to install dependencies.
+        pause
+        exit /b 1
+    )
+    echo ✅ Dependencies installed.
+    echo.
+)
 
 REM Check if FastAPI port is available
 netstat -ano | findstr :8000 >nul
@@ -25,7 +59,7 @@ echo.
 echo Press Ctrl+C to stop the server...
 echo.
 
-uvicorn src.fastapi_service:app --host 0.0.0.0 --port %FASTAPI_PORT% --reload
+python -m uvicorn src.fastapi_service:app --host 0.0.0.0 --port %FASTAPI_PORT% --reload
 
 pause
 
