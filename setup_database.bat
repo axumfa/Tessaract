@@ -1,24 +1,45 @@
 @echo off
+chcp 65001 >nul
 REM Script to help setup PostgreSQL database for Fraud Detection API
 
-echo 🐘 PostgreSQL Database Setup for Fraud Detection API
+echo [92m PostgreSQL Database Setup for Fraud Detection API[0m
 echo.
 
-REM Check if psql is available
+:check_psql
+REM Check custom PostgreSQL installation path first
+set "PSQL_CUSTOM_PATH=D:\Apps\PostgreSQL\bin"
+if exist "%PSQL_CUSTOM_PATH%\psql.exe" (
+    set "PATH=%PSQL_CUSTOM_PATH%;%PATH%"
+    echo Found PostgreSQL at %PSQL_CUSTOM_PATH%
+    goto psql_found
+)
+
+REM Check if psql is available in PATH
 where psql >nul 2>&1
 if errorlevel 1 (
     echo ❌ PostgreSQL is not installed or not in PATH!
     echo.
     echo Please:
-    echo 1. Install PostgreSQL from: https://www.postgresql.org/download/windows/
-    echo 2. Add PostgreSQL bin folder to PATH:
-    echo    C:\Program Files\PostgreSQL\15\bin
-    echo 3. Restart terminal and run this script again
+    echo 1. Make sure PostgreSQL is installed
+    echo 2. Your PostgreSQL should be at: D:\Apps\PostgreSQL
+    echo    Make sure the bin directory exists at: D:\Apps\PostgreSQL\bin
+    echo 3. Or enter the full path to your psql.exe location:
+    set /p PSQL_PATH="PostgreSQL bin directory (or press Enter to exit): "
+    if not "%PSQL_PATH%"=="" (
+        if exist "%PSQL_PATH%\psql.exe" (
+            set "PATH=%PSQL_PATH%;%PATH%"
+            echo Added %PSQL_PATH% to PATH
+            goto psql_found
+        ) else (
+            echo ❌ psql.exe not found in specified directory
+        )
+    )
     echo.
     pause
     exit /b 1
 )
 
+:psql_found
 echo ✅ PostgreSQL found!
 echo.
 
@@ -26,8 +47,22 @@ REM Get database credentials
 echo Enter PostgreSQL credentials:
 echo.
 
+echo [96mDefault settings:[0m
+echo  - Host: localhost (or 127.0.0.1)
+echo  - Port: 5432
+echo  - Database: fraud_detection
+echo  - User: postgres
+echo.
+
 set /p DB_HOST="Database Host [localhost]: "
 if "%DB_HOST%"=="" set DB_HOST=localhost
+if "%DB_HOST%"=="8000" (
+    echo [91mError: 8000 is a port number, not a host. Using localhost instead.[0m
+    set DB_HOST=localhost
+)
+
+set /p DB_PORT="Database Port [5432]: "
+if "%DB_PORT%"=="" set DB_PORT=5432
 
 set /p DB_NAME="Database Name [fraud_detection]: "
 if "%DB_NAME%"=="" set DB_NAME=fraud_detection
@@ -64,7 +99,7 @@ if %errorlevel% == 0 (
 )
 
 REM Create database
-psql -h %DB_HOST% -U %DB_USER% -d postgres -c "CREATE DATABASE %DB_NAME%;"
+psql -h %DB_HOST% -p %DB_PORT% -U %DB_USER% -d postgres -c "CREATE DATABASE %DB_NAME%;"
 if errorlevel 1 (
     echo ❌ Failed to create database!
     echo Please check your credentials and try again.

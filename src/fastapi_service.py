@@ -262,37 +262,101 @@ def predict_batch(batch: BatchTransactions):
 async def predict_from_csv(file: UploadFile = File(...)):
     """Predict fraud from CSV file upload"""
     if model is None:
+        logger.error("Model not loaded. Check if fraud_detection_model.pkl exists in src directory")
         raise HTTPException(status_code=500, detail="Model not loaded")
     
     try:
+        # Log file details
+        logger.info(f"Received CSV file: {file.filename}, content_type: {file.content_type}")
+        
         # Read CSV file
         contents = await file.read()
-        buffer = io.StringIO(contents.decode('utf-8'))
+        try:
+            text_content = contents.decode('utf-8')
+            logger.info("Successfully decoded CSV content as UTF-8")
+        except UnicodeDecodeError:
+            # Try with a different encoding if UTF-8 fails
+            text_content = contents.decode('latin-1')
+            logger.info("Decoded CSV content as latin-1")
+            
+        buffer = io.StringIO(text_content)
         csv_reader = csv.DictReader(buffer)
         
+        # Validate CSV headers
+        headers = csv_reader.fieldnames
+        logger.info(f"CSV headers: {headers}")
+        
+        # Define field mappings (your CSV format -> expected format)
+        field_mappings = {
+            'Amount': 'amount',  # Map 'Amount' to 'amount'
+            'hour': 'hour',     # These are already correct
+            'dayofweek': 'dayofweek',
+            'txns_last_24h': 'txns_last_24h',
+            'amount_last_24h': 'amount_last_24h',
+            'risk_score': 'risk_score'
+        }
+        
+        # Check if required fields exist (using original column names)
+        required_fields = ['Amount', 'hour', 'dayofweek', 'txns_last_24h', 'amount_last_24h', 'risk_score']
+        missing_fields = [field for field in required_fields if field not in headers]
+        if missing_fields:
+            error_msg = f"Missing required columns: {missing_fields}"
+            logger.error(error_msg)
+            raise HTTPException(status_code=400, detail=error_msg)
+        
         transactions = []
+        row_count = 0
+        error_count = 0
+        
         for row in csv_reader:
+            row_count += 1
             try:
-                # Convert string values to appropriate types
+                # Log row data for debugging
+                logger.debug(f"Processing row {row_count}: {row}")
+                
+                # Convert string values to appropriate types using the correct column names
                 transaction = Transaction(
-                    amount=float(row.get('amount', 0)),
+                    amount=float(row.get('Amount', 0)),  # Use 'Amount' instead of 'amount'
                     hour=int(row.get('hour', 0)),
                     dayofweek=int(row.get('dayofweek', 0)),
                     txns_last_24h=float(row.get('txns_last_24h', 0)),
                     amount_last_24h=float(row.get('amount_last_24h', 0)),
                     risk_score=float(row.get('risk_score', 0)),
-                    transaction_id=row.get('transaction_id', str(uuid.uuid4()))
+                    transaction_id=row.get('Time', str(uuid.uuid4()))  # Use 'Time' as transaction_id if available
                 )
                 transactions.append(transaction)
+            except ValueError as ve:
+                error_count += 1
+                logger.warning(f"Invalid value in row {row_count}: {str(ve)}")
             except Exception as e:
-                logger.warning(f"Skipping invalid row: {str(e)}")
+                error_count += 1
+                logger.warning(f"Error processing row {row_count}: {str(e)}")
+        
+        if not transactions:
+            error_msg = f"No valid transactions found in CSV. Processed {row_count} rows with {error_count} errors."
+            logger.error(error_msg)
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        logger.info(f"Successfully processed {len(transactions)} transactions from CSV")
         
         # Use batch prediction logic
         batch = BatchTransactions(transactions=transactions)
-        return predict_batch(batch)
+        result = predict_batch(batch)
+        
+        # Add processing summary to response
+        result.summary.update({
+            "total_rows_processed": row_count,
+            "valid_transactions": len(transactions),
+            "errors": error_count
+        })
+        
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"CSV prediction error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"CSV prediction error: {str(e)}"
+        logger.error(error_msg, exc_info=True)  # Include stack trace
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/transactions")
 def get_recent_transactions_endpoint(limit: int = 100):
