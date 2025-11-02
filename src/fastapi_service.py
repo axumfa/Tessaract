@@ -14,6 +14,15 @@ import logging
 import csv
 import io
 
+# Load .env file if it exists (before importing database module)
+try:
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from load_env import load_env_file
+    load_env_file()
+except Exception:
+    pass  # Continue if .env loading fails
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -25,44 +34,18 @@ logger = logging.getLogger(__name__)
 # Import Redis cache
 from src.redis_cache import get_cached_transaction, cache_transaction
 
-# Database connection (PostgreSQL)
-try:
-    import psycopg2
-    from psycopg2.extras import Json
-    
-    # Initialize database connection
-    # Replace with your actual database credentials
-    DB_HOST = os.getenv("DB_HOST", "localhost")
-    DB_NAME = os.getenv("DB_NAME", "fraud_detection")
-    DB_USER = os.getenv("DB_USER", "postgres")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
-    
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD
-    )
-    
-    # Create predictions table if it doesn't exist
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS predictions (
-            id SERIAL PRIMARY KEY,
-            transaction_id VARCHAR(50),
-            transaction_data JSONB,
-            prediction BOOLEAN,
-            confidence FLOAT,
-            timestamp TIMESTAMP
-        )
-        """)
-        conn.commit()
-    
-    db_available = True
-    logger.info("Database connection established")
-except Exception as e:
-    logger.warning(f"Database connection failed: {str(e)}")
-    db_available = False
+# Import database module
+from src.database import (
+    init_db,
+    is_db_available,
+    log_prediction,
+    get_recent_transactions,
+    get_fraud_stats,
+    close_db_pool
+)
+
+# Initialize database connection pool
+db_available = init_db()
 
 app = FastAPI(title="Fraud Detection API")
 
@@ -106,31 +89,7 @@ class BatchPredictionResponse(BaseModel):
     predictions: List[PredictionResponse]
     summary: dict
 
-def log_prediction(transaction_id, transaction_data, prediction, confidence):
-    """Log prediction to database if available"""
-    if db_available:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO predictions 
-                    (transaction_id, transaction_data, prediction, confidence, timestamp)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (
-                        transaction_id,
-                        Json(transaction_data),
-                        prediction,
-                        confidence,
-                        datetime.datetime.now()
-                    )
-                )
-                conn.commit()
-            logger.info(f"Prediction logged for transaction {transaction_id}")
-        except Exception as e:
-            logger.error(f"Failed to log prediction: {str(e)}")
-    else:
-        logger.warning("Database not available, prediction not logged")
+# log_prediction function is now imported from database module
 
 @app.get("/")
 def home():
@@ -142,7 +101,7 @@ def health_check():
     return {
         "status": "healthy",
         "model_loaded": model is not None,
-        "database_connected": db_available
+        "database_connected": is_db_available()
     }
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -189,7 +148,7 @@ def predict_fraud(transaction: Transaction):
         }
         cache_transaction(transaction_id, result)
         
-        # Log prediction to database
+        # Log prediction to database (non-blocking, returns immediately)
         log_prediction(
             transaction_id=transaction_id,
             transaction_data=transaction.dict(),
@@ -216,7 +175,26 @@ def predict_batch(batch: BatchTransactions):
     try:
         predictions = []
         
-        for transaction in batch.transactions:
+        # Optimize: Create DataFrame for all transactions at once
+        transactions_data = [t.dict() for t in batch.transactions]
+        df = pd.DataFrame(transactions_data)
+        
+        # Remove transaction_id from features if present
+        if "transaction_id" in df.columns:
+            df_features = df.drop("transaction_id", axis=1)
+        else:
+            df_features = df.copy()
+        
+        # Ensure feature names match the model's training data
+        if "amount" in df_features.columns:
+            df_features.rename(columns={"amount": "Amount"}, inplace=True)
+        
+        # Predict for all transactions at once (much faster!)
+        fraud_predictions = model.predict(df_features)
+        fraud_probabilities = model.predict_proba(df_features)
+        
+        # Process results
+        for i, transaction in enumerate(batch.transactions):
             transaction_id = transaction.transaction_id or str(uuid.uuid4())
             
             # Check cache first
@@ -232,21 +210,9 @@ def predict_batch(batch: BatchTransactions):
                 )
                 continue
             
-            # Prepare data for prediction
-            df = pd.DataFrame([transaction.dict()])
-            
-            # Remove transaction_id from features
-            if "transaction_id" in df.columns:
-                df = df.drop("transaction_id", axis=1)
-            
-            # Ensure feature names match the model's training data
-            df.rename(columns={"amount": "Amount"}, inplace=True)
-            
-            # Predict fraud using the trained model
-            is_fraud = bool(model.predict(df)[0])
-            
-            # Get prediction probabilities for confidence score
-            proba = model.predict_proba(df)[0]
+            # Use batch prediction results (already computed)
+            is_fraud = bool(fraud_predictions[i])
+            proba = fraud_probabilities[i]
             confidence = float(proba[1] if is_fraud else proba[0])
             
             # Cache the result
@@ -329,111 +295,50 @@ async def predict_from_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/transactions")
-def get_recent_transactions(limit: int = 100):
+def get_recent_transactions_endpoint(limit: int = 100):
     """Get recent transactions from the database"""
-    if not db_available:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT transaction_id, transaction_data, prediction, confidence, timestamp
-                FROM predictions
-                ORDER BY timestamp DESC
-                LIMIT %s
-                """,
-                (limit,)
-            )
-            rows = cur.fetchall()
-            
-            transactions = []
-            for row in rows:
-                transactions.append({
-                    "transaction_id": row[0],
-                    "transaction_data": row[1],
-                    "is_fraud": row[2],
-                    "confidence": row[3],
-                    "timestamp": row[4].isoformat()
-                })
-            
-            return {"transactions": transactions}
+        transactions = get_recent_transactions(limit)
+        # Convert RealDictRow to dict and format timestamp
+        formatted_transactions = []
+        for row in transactions:
+            formatted_transactions.append({
+                "transaction_id": row['transaction_id'],
+                "transaction_data": row['transaction_data'],
+                "is_fraud": row['prediction'],
+                "confidence": float(row['confidence']),
+                "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp'])
+            })
+        return {"transactions": formatted_transactions}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Database query error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/stats")
-def get_fraud_stats():
+def get_fraud_stats_endpoint():
     """Get fraud statistics for dashboard"""
-    if not db_available:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
     try:
-        with conn.cursor() as cur:
-            # Get total transactions and fraud count
-            cur.execute(
-                """
-                SELECT 
-                    COUNT(*) as total,
-                    SUM(CASE WHEN prediction = true THEN 1 ELSE 0 END) as fraud_count
-                FROM predictions
-                """
-            )
-            total, fraud_count = cur.fetchone()
-            
-            # Get fraud by hour
-            cur.execute(
-                """
-                SELECT 
-                    EXTRACT(HOUR FROM timestamp) as hour,
-                    COUNT(*) as count,
-                    SUM(CASE WHEN prediction = true THEN 1 ELSE 0 END) as fraud_count
-                FROM predictions
-                GROUP BY hour
-                ORDER BY hour
-                """
-            )
-            hourly_stats = []
-            for row in cur.fetchall():
-                hourly_stats.append({
-                    "hour": int(row[0]),
-                    "total": row[1],
-                    "fraud_count": row[2],
-                    "fraud_percentage": (row[2] / row[1]) * 100 if row[1] > 0 else 0
-                })
-            
-            # Get recent trend (last 7 days)
-            cur.execute(
-                """
-                SELECT 
-                    DATE(timestamp) as date,
-                    COUNT(*) as count,
-                    SUM(CASE WHEN prediction = true THEN 1 ELSE 0 END) as fraud_count
-                FROM predictions
-                WHERE timestamp >= NOW() - INTERVAL '7 days'
-                GROUP BY date
-                ORDER BY date
-                """
-            )
-            daily_stats = []
-            for row in cur.fetchall():
-                daily_stats.append({
-                    "date": row[0].isoformat(),
-                    "total": row[1],
-                    "fraud_count": row[2],
-                    "fraud_percentage": (row[2] / row[1]) * 100 if row[1] > 0 else 0
-                })
-            
-            return {
-                "total_transactions": total,
-                "fraud_count": fraud_count,
-                "fraud_percentage": (fraud_count / total) * 100 if total > 0 else 0,
-                "hourly_stats": hourly_stats,
-                "daily_stats": daily_stats
-            }
+        return get_fraud_stats()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Stats query error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    if not init_db():
+        logger.warning("Database initialization failed. Some features may not work.")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close database connections on shutdown"""
+    close_db_pool()
+    logger.info("Application shutdown complete")
 
 if __name__ == "__main__":
     import uvicorn

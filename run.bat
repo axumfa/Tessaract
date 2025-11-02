@@ -4,6 +4,19 @@ REM Simple batch script to run FastAPI service on Windows
 echo 🚀 Starting Fraud Detection System...
 echo.
 
+REM Load environment variables from .env file if it exists
+if exist ".env" (
+    echo 🔹 Loading database configuration from .env file...
+    for /f "usebackq tokens=1,2 delims==" %%a in (".env") do (
+        REM Skip empty lines and comments
+        if not "%%a"=="" if not "%%a"=="REM" (
+            set "%%a=%%b"
+        )
+    )
+    echo [OK] Configuration loaded
+    echo.
+)
+
 REM Check if virtual environment exists
 if not exist "venv\Scripts\activate.bat" (
     echo ❌ Virtual environment not found!
