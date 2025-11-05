@@ -13,6 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import csv
 import io
+import warnings
+import sys
+from io import StringIO
 
 # Setup logging
 logging.basicConfig(
@@ -41,7 +44,8 @@ try:
         host=DB_HOST,
         database=DB_NAME,
         user=DB_USER,
-        password=DB_PASSWORD
+        password=DB_PASSWORD,
+        connect_timeout=5
     )
     
     # Create predictions table if it doesn't exist
@@ -60,9 +64,22 @@ try:
     
     db_available = True
     logger.info("Database connection established")
-except Exception as e:
-    logger.warning(f"Database connection failed: {str(e)}")
+except ImportError:
+    # psycopg2 not installed
+    logger.info("psycopg2 not installed. Database features will be disabled. (This is OK - the API works without it!)")
     db_available = False
+    conn = None
+    psycopg2 = None
+except Exception as e:
+    # Database connection errors or other exceptions
+    # Truncate long error messages for cleaner logs
+    error_msg = str(e).split('\n')[0] if '\n' in str(e) else str(e)
+    # Limit error message length
+    if len(error_msg) > 100:
+        error_msg = error_msg[:97] + "..."
+    logger.info(f"Database connection not available: {error_msg}. Database features will be disabled. (This is OK - the API works without it!)")
+    db_available = False
+    conn = None
 
 app = FastAPI(title="Fraud Detection API")
 
@@ -77,7 +94,40 @@ app.add_middleware(
 
 # Load trained model
 try:
-    model = joblib.load('src/fraud_detection_model.pkl')
+    # Suppress scikit-learn version warnings when loading models
+    # This warning occurs when loading models trained with older sklearn versions
+    # The InconsistentVersionWarning is a UserWarning subclass from sklearn
+    
+    # Import sklearn to access the warning class
+    try:
+        from sklearn.utils._warnings import InconsistentVersionWarning
+        # Register filter for this specific warning type
+        warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+    except ImportError:
+        pass  # sklearn.utils._warnings might not exist in all versions
+    
+    # Comprehensive warning suppression
+    with warnings.catch_warnings():
+        # Suppress ALL warnings during model loading
+        warnings.simplefilter("ignore")
+        # Additional filters for sklearn
+        warnings.filterwarnings("ignore", module="sklearn")
+        warnings.filterwarnings("ignore", module="sklearn.base")
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+        warnings.filterwarnings("ignore", message=".*Trying to unpickle.*")
+        warnings.filterwarnings("ignore", message=".*InconsistentVersionWarning.*")
+        warnings.filterwarnings("ignore", message=".*version.*when using version.*")
+        warnings.filterwarnings("ignore", message=".*1\\.6\\.1.*1\\.7\\.2.*")
+        
+        # Redirect stderr to catch any direct prints from sklearn
+        stderr_capture = StringIO()
+        original_stderr = sys.stderr
+        sys.stderr = stderr_capture
+        try:
+            model = joblib.load('src/fraud_detection_model.pkl')
+        finally:
+            sys.stderr = original_stderr
+            
     logger.info("Model loaded successfully")
 except Exception as e:
     logger.error(f"Failed to load model: {str(e)}")
@@ -106,8 +156,12 @@ class BatchPredictionResponse(BaseModel):
     predictions: List[PredictionResponse]
     summary: dict
 
+# Track if we've already warned about database being unavailable (to avoid spam)
+_db_warning_logged = False
+
 def log_prediction(transaction_id, transaction_data, prediction, confidence):
     """Log prediction to database if available"""
+    global _db_warning_logged
     if db_available:
         try:
             with conn.cursor() as cur:
@@ -130,7 +184,10 @@ def log_prediction(transaction_id, transaction_data, prediction, confidence):
         except Exception as e:
             logger.error(f"Failed to log prediction: {str(e)}")
     else:
-        logger.warning("Database not available, prediction not logged")
+        # Only log warning once to avoid spam when processing many transactions
+        if not _db_warning_logged:
+            logger.debug("Database not available - predictions will not be logged to database (this message shown once)")
+            _db_warning_logged = True
 
 @app.get("/")
 def home():
@@ -294,7 +351,15 @@ def predict_batch(batch: BatchTransactions):
 
 @app.post("/predict/csv")
 async def predict_from_csv(file: UploadFile = File(...)):
-    """Predict fraud from CSV file upload"""
+    """Predict fraud from CSV file upload
+    
+    Returns a JSON response with:
+    - predictions: List of predictions for each transaction
+    - summary: Summary statistics (total, fraud count, fraud percentage)
+    
+    CSV format should have columns: amount, hour, dayofweek, txns_last_24h, amount_last_24h, risk_score
+    Optional: transaction_id
+    """
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
     
@@ -304,26 +369,59 @@ async def predict_from_csv(file: UploadFile = File(...)):
         buffer = io.StringIO(contents.decode('utf-8'))
         csv_reader = csv.DictReader(buffer)
         
+        # Make column names case-insensitive and handle variations
+        def get_column(row, possible_names, default_value):
+            """Get column value, trying multiple possible column names (case-insensitive)"""
+            row_lower = {k.lower(): v for k, v in row.items()}
+            for name in possible_names:
+                if name.lower() in row_lower:
+                    return row_lower[name.lower()]
+            return default_value
+        
         transactions = []
-        for row in csv_reader:
+        skipped_count = 0
+        for row_num, row in enumerate(csv_reader, start=2):  # start=2 because row 1 is header
             try:
-                # Convert string values to appropriate types
+                # Get amount (handle both 'amount' and 'Amount')
+                amount_val = get_column(row, ['amount', 'Amount'], '0')
+                if not amount_val:
+                    amount_val = '0'
+                
+                # Convert hour and dayofweek - handle both int and float strings
+                hour_val = get_column(row, ['hour', 'Hour'], '0')
+                dayofweek_val = get_column(row, ['dayofweek', 'DayOfWeek', 'day_of_week'], '0')
+                
+                # Convert to appropriate types (handle float strings by converting to int)
                 transaction = Transaction(
-                    amount=float(row.get('amount', 0)),
-                    hour=int(row.get('hour', 0)),
-                    dayofweek=int(row.get('dayofweek', 0)),
-                    txns_last_24h=float(row.get('txns_last_24h', 0)),
-                    amount_last_24h=float(row.get('amount_last_24h', 0)),
-                    risk_score=float(row.get('risk_score', 0)),
-                    transaction_id=row.get('transaction_id', str(uuid.uuid4()))
+                    amount=float(amount_val),
+                    hour=int(float(hour_val)) if hour_val else 0,  # Convert float string to int
+                    dayofweek=int(float(dayofweek_val)) if dayofweek_val else 0,  # Convert float string to int
+                    txns_last_24h=float(get_column(row, ['txns_last_24h', 'txns_last_24H'], '0')),
+                    amount_last_24h=float(get_column(row, ['amount_last_24h', 'amount_last_24H'], '0')),
+                    risk_score=float(get_column(row, ['risk_score', 'risk_Score'], '0')),
+                    transaction_id=get_column(row, ['transaction_id', 'transaction_ID', 'Transaction_ID'], str(uuid.uuid4()))
                 )
                 transactions.append(transaction)
             except Exception as e:
-                logger.warning(f"Skipping invalid row: {str(e)}")
+                skipped_count += 1
+                logger.warning(f"Skipping invalid row {row_num}: {str(e)}")
+        
+        if len(transactions) == 0:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"No valid transactions found in CSV. {skipped_count} row(s) were skipped due to errors."
+            )
+        
+        if skipped_count > 0:
+            logger.info(f"Successfully parsed {len(transactions)} transactions. {skipped_count} row(s) were skipped.")
         
         # Use batch prediction logic
         batch = BatchTransactions(transactions=transactions)
-        return predict_batch(batch)
+        result = predict_batch(batch)
+        logger.info(f"CSV processing complete: {len(transactions)} transactions processed")
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"CSV prediction error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
